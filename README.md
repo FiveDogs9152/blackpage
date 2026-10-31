@@ -17,12 +17,29 @@ curl -fsSL https://raw.githubusercontent.com/FiveDogs9152/blackpage/main/deploy.
 
 ```bash
 bash deploy.sh                 # 装上并启动（默认 8080）
-PORT=9000 bash deploy.sh       # 换端口
+PORT=9000 bash deploy.sh       # 点名端口
+DOMAIN=txt.example.com EMAIL=you@x.com bash deploy.sh   # 有域名：走 443 + 证书
+DRY=1 ... bash deploy.sh       # 只打印计划，一根手指都不动
 bash deploy.sh status          # 看地址、状态、内容路径
 bash deploy.sh set "今天休息"   # 不开浏览器，命令行直接改
 bash deploy.sh log             # 最近 50 行日志
 bash deploy.sh down            # 停掉自己
 ```
+
+## 它会自己怎么选（不用你操心）
+
+| 机器情况 | 脚本的做法 |
+| --- | --- |
+| 端口空着 | 直接起 |
+| 8080 被别人占着、你没点名端口 | 自动往后挪一个（8081、8082…），**不碰别人的进程**，并把选中的端口写进 `port.txt`，之后 `down` / `status` 自己认得 |
+| 你点名了 `PORT=x` 而它被占 | 打印 PID + 命令行，问你；非交互直接退出 |
+| 没装 python3 | 依次尝试 apt / dnf / yum / apk / pacman / zypper 装一个，装不上才报错 |
+| 给了 `DOMAIN`，443 空着、你是 root | 上 443：先找 `~/.acme.sh` 里的现成证书 → 没有就让 acme.sh 签（要 `EMAIL`）→ 都不行就自签 |
+| 给了 `DOMAIN`，但 443 被别人占着 | 不抢，退回 8080 明文当后端，打印现成的 nginx / Caddy 反代片段给你粘 |
+| 给了 `DOMAIN`，但没有 root | 起在 8443 + 自签证书，并说明 root 下重跑就是 443 |
+| 什么都没给 | 8080 明文，行为和最初一模一样 |
+
+`port.txt` 是关键：换过端口之后，`bash deploy.sh down` 不需要你再记是哪个端口。
 
 ## 端口保护（重点）
 

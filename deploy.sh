@@ -1,20 +1,30 @@
 #!/usr/bin/env bash
-# blackpage · 最小黑底白字页面
+# blackpage · 最小黑底白字页面（单文件，只用 python3 标准库）
 #
-#   curl -fsSL <这个文件的地址> | bash     # 装上并跑起来（默认 8080）
-#   PORT=9000 bash deploy.sh              # 换端口
-#   bash deploy.sh status                 # 看地址和状态
-#   bash deploy.sh set "想写什么写什么"     # 直接改页面内容
-#   bash deploy.sh down                   # 停掉自己
+#   curl -fsSL <地址> | bash                                # 起在 8080，明文
+#   DOMAIN=txt.example.com EMAIL=you@x.com bash deploy.sh   # 有域名就走 443 + 证书
+#   PORT=9000 bash deploy.sh                                # 点名端口
+#   DRY=1 DOMAIN=txt.example.com bash deploy.sh             # 只看计划，不动手
+#   bash deploy.sh status | set "文字" | down | log
 #
-# 端口被别人的服务占着时：只报告，绝不动它。
-# 确认真要停掉它，才用 FORCE=1 bash deploy.sh。
+# 端口被别人的服务占着：默认只报告、自动往后挪一个，绝不动别人的进程。
+# 你确认要停掉它，才用 FORCE=1 bash deploy.sh。
 set -euo pipefail
 
-PORT="${PORT:-8080}"
 APP_DIR="${APP_DIR:-$HOME/.blackpage}"
+PORT="${PORT:-}"
+# 自动换过端口的话，下次 down/status 得知道是哪个端口
+if [ -z "$PORT" ] && [ -r "$APP_DIR/port.txt" ]; then
+  PORT=$(tr -dc '0-9' <"$APP_DIR/port.txt" 2>/dev/null || true)
+fi
+PORT_GIVEN=0
+if [ -n "$PORT" ]; then PORT_GIVEN=1; fi
+PORT="${PORT:-8080}"
 BIND="${HOST:-0.0.0.0}"
 FORCE="${FORCE:-0}"
+DOMAIN="${DOMAIN:-}"                  # 给了域名就想办法上 443 + 证书
+EMAIL="${EMAIL:-}"                    # 给 acme.sh 注册用，没有就跳过自动签
+DRY="${DRY:-0}"                       # DRY=1 只打印计划，不动手
 TLS_CERT="${TLS_CERT:-}"              # 给了证书就自己说 HTTPS，不给就是明文
 TLS_KEY="${TLS_KEY:-}"
 SCHEME=http
@@ -23,6 +33,9 @@ if [ -n "$TLS_CERT" ]; then SCHEME=https; fi
 PIDFILE="$APP_DIR/server.$PORT.pid"   # 一个端口一个 pidfile，实例互不覆盖
 KEYFILE="$APP_DIR/key.txt"
 CONTENT="$APP_DIR/content.txt"
+INSTANCE_FILE="$APP_DIR/instance.txt"
+INSTANCE=""
+if [ -r "$INSTANCE_FILE" ]; then INSTANCE=$(tr -dc 'A-Za-z0-9' <"$INSTANCE_FILE" 2>/dev/null || true); fi
 LOG="$APP_DIR/server.$PORT.log"
 SRV="$APP_DIR/server.py"
 
@@ -97,6 +110,44 @@ port_owner() {
   fi
   printf '%s' "$pid"
   return 0
+}
+
+# 直接问端口上的服务「你是谁」：不管 PID 怎么映射，这一步都不会骗人
+probe_health() {
+  local p="$1"
+  [ -n "${PY:-}" ] || return 0
+  "$PY" - "$p" <<'PY' 2>/dev/null || true
+import json, ssl, sys, urllib.request
+port = int(sys.argv[1])
+ctx = ssl._create_unverified_context()
+for scheme in ("http", "https"):
+    try:
+        u = f"{scheme}://127.0.0.1:{port}/health"
+        with urllib.request.urlopen(u, timeout=1.2, context=ctx) as r:
+            d = json.loads(r.read().decode("utf-8"))
+        if d.get("app") == "blackpage":
+            print(d.get("instance", ""), d.get("pid", ""))
+            break
+    except Exception:
+        continue
+PY
+}
+
+# 端口上的服务是不是本 APP_DIR 起的那一个
+port_is_ours() {
+  local p="$1" got=""
+  got=$(probe_health "$p")
+  [ -n "$got" ] || return 1
+  [ "${got%% *}" = "${INSTANCE:-}" ] || return 1
+  return 0
+}
+
+# 从 /health 直接拿到真实 pid（比 pidfile / netstat 都可信）
+health_pid() {
+  local got=""
+  got=$(probe_health "$1")
+  [ -n "$got" ] || return 1
+  printf '%s' "${got##* }"
 }
 
 # 等端口真的空出来（最多 N 秒）
@@ -178,6 +229,7 @@ write_server() {
 from __future__ import annotations
 
 import html
+import json
 import os
 import sys
 import threading
@@ -191,6 +243,7 @@ PORT = int(os.environ.get("PORT", "8080"))
 EDIT_KEY = os.environ.get("EDIT_KEY", "").strip()
 TLS_CERT = os.environ.get("TLS_CERT", "").strip()
 TLS_KEY = os.environ.get("TLS_KEY", "").strip()
+INSTANCE = os.environ.get("INSTANCE", "").strip()
 MAX_BODY = 1 << 20
 
 _lock = threading.Lock()
@@ -302,7 +355,9 @@ class Handler(BaseHTTPRequestHandler):
         q = parse_qs(u.query)
         k = q.get("k", [""])[0]
         if u.path == "/health":
-            return self._send(200, b"ok", "text/plain; charset=utf-8")
+            body = json.dumps({"app": "blackpage", "instance": INSTANCE,
+                               "pid": os.getpid()}).encode("utf-8")
+            return self._send(200, body, "application/json; charset=utf-8")
         if u.path == "/raw":
             return self._send(200, read_content().encode("utf-8"),
                               "text/plain; charset=utf-8")
@@ -371,8 +426,12 @@ PYEOF
 
 cmd_down() {
   local pid="" i=0 o=""
+  if [ -z "${PY:-}" ]; then PY=$(pick_python 2>/dev/null || true); fi
   if [ -f "$PIDFILE" ]; then pid=$(cat "$PIDFILE" 2>/dev/null || true); fi
   # pidfile 对不上（重启过、换了平台）就用端口找主人，只认命令行里带 server.py 的
+  if [ -z "$pid" ] || ! alive "$pid"; then
+    if port_is_ours "$PORT"; then pid=$(health_pid "$PORT" || true); fi
+  fi
   if [ -z "$pid" ] || ! alive "$pid"; then
     o=$(port_owner "$PORT")
     if [ -n "$o" ] && is_ours "$o"; then pid="$o"; fi
@@ -423,11 +482,152 @@ cmd_status() {
   printf '  日志  %s\n' "$LOG"
 }
 
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# 没 python 就试着用系统包管理器装（能装就装，装不上再报错）
+install_python() {
+  printf '没找到 python3，试着装一个…\n' >&2
+  local s root=0
+  [ "$(id -u)" -eq 0 ] && root=1
+  for s in "apt-get install -y python3" "apt install -y python3" \
+           "dnf install -y python3" "yum install -y python3" \
+           "apk add --no-cache python3" "pacman -S --noconfirm python" \
+           "zypper -n install python3"; do
+    have "${s%% *}" || continue
+    if [ "$root" -eq 1 ]; then $s >/dev/null 2>&1 && return 0
+    elif have sudo; then sudo $s >/dev/null 2>&1 && return 0
+    fi
+  done
+  return 1
+}
+
+find_free_port() {
+  local p="${1:-8080}" n=0
+  while [ "$n" -lt 60 ]; do
+    port_busy "$p" || { printf '%s' "$p"; return 0; }
+    p=$((p + 1)); n=$((n + 1))
+  done
+  return 1
+}
+
+# 端口被别人占着时：没点名就自动往后挪一个，绝不动别人的进程
+resolve_port() {
+  port_busy "$PORT" || return 0
+  local o; o=$(port_owner "$PORT")
+  if [ -n "$o" ] && is_ours "$o"; then return 0; fi
+  if [ "$PORT_GIVEN" -eq 1 ]; then return 0; fi
+  local np; np=$(find_free_port $((PORT + 1))) || die "端口都被占了，用 PORT=xxxx 指定一个"
+  warn "端口 $PORT 被别人占着（不是本服务），自动换到 $np，没动它"
+  PORT="$np"; PIDFILE="$APP_DIR/server.$PORT.pid"; LOG="$APP_DIR/server.$PORT.log"
+}
+
+detect_web() {
+  local w
+  for w in nginx caddy openresty apache2 httpd; do
+    have "$w" && { printf '%s' "$w"; return 0; }
+  done
+  return 1
+}
+
+print_proxy_hint() {
+  local d="${DOMAIN:-你的域名}" w
+  w=$(detect_web || true)
+  printf '\n443 已经被别的服务占着，不用抢，让它反代过来（配置自己粘，脚本不改你的文件）：\n' >&2
+  if [ "$w" = caddy ]; then
+    printf '  %s {\n      reverse_proxy 127.0.0.1:%s\n  }\n' "$d" "$PORT" >&2
+  else
+    printf '  server {\n      listen 443 ssl;\n      server_name %s;\n      # ssl_certificate 用你现有的证书\n      location / { proxy_pass http://127.0.0.1:%s; proxy_set_header Host $host; }\n  }\n' "$d" "$PORT" >&2
+  fi
+}
+
+selfsign() {
+  local d="$1"
+  have openssl || return 1
+  mkdir -p "$APP_DIR/tls"
+  # 在 tls 目录里用相对文件名：原生 openssl 认不了 MSYS 的 /g/... 路径
+  ( cd "$APP_DIR/tls" && MSYS2_ARG_CONV_EXCL='*' openssl req -x509 -newkey rsa:2048 -nodes -days 365 \
+      -keyout key.pem -out fullchain.pem \
+      -subj "/CN=$d" -addext "subjectAltName=DNS:$d" >/dev/null 2>&1 ) || return 1
+  TLS_CERT="$APP_DIR/tls/fullchain.pem"; TLS_KEY="$APP_DIR/tls/key.pem"
+  warn "用的是自签证书：浏览器会提示不安全，点“继续访问”就能看"
+}
+
+acme_cert() {
+  local d="$1" acme="$HOME/.acme.sh/acme.sh"
+  [ -n "$EMAIL" ] || return 1
+  have curl || return 1
+  port_busy 80 && { warn "80 被占着，acme.sh 没法用 standalone 签，改走自签"; return 1; }
+  if [ ! -x "$acme" ]; then
+    curl -fsSL https://get.acme.sh | sh -s "email=$EMAIL" >/dev/null 2>&1 || return 1
+  fi
+  [ -x "$acme" ] || return 1
+  mkdir -p "$APP_DIR/tls"
+  "$acme" --issue -d "$d" --standalone >/dev/null 2>&1 || true
+  "$acme" --install-cert -d "$d" \
+    --key-file "$APP_DIR/tls/key.pem" \
+    --fullchain-file "$APP_DIR/tls/fullchain.pem" >/dev/null 2>&1 || return 1
+  TLS_CERT="$APP_DIR/tls/fullchain.pem"; TLS_KEY="$APP_DIR/tls/key.pem"
+  ok "acme.sh 证书已就位（60 天自动续期）"
+}
+
+ensure_cert() {
+  [ -n "$TLS_CERT" ] && return 0
+  local le="$HOME/.acme.sh/$DOMAIN/fullchain.cer" lk="$HOME/.acme.sh/$DOMAIN/$DOMAIN.key"
+  if [ -r "$le" ] && [ -r "$lk" ]; then
+    TLS_CERT="$le"; TLS_KEY="$lk"; ok "复用 ~/.acme.sh 里已有的证书"
+  elif acme_cert "$DOMAIN"; then :
+  elif selfsign "$DOMAIN"; then :
+  else warn "拿不到证书（没 openssl / 没 network），退回明文 HTTP"; return 1
+  fi
+  return 0
+}
+
+# 有域名：优先 443 + 证书；443 被占或没 root 就降级，并把话说清楚
+resolve_plan() {
+  [ -n "$DOMAIN" ] || return 0
+  if [ "$PORT_GIVEN" -eq 0 ]; then
+    if port_busy 443; then
+      print_proxy_hint
+    elif [ "$(id -u)" -ne 0 ]; then
+      warn "不是 root，绑不了 443；先起在 8443（root 下重跑就是 443）"
+      PORT=8443
+    else
+      PORT=443
+    fi
+    PIDFILE="$APP_DIR/server.$PORT.pid"; LOG="$APP_DIR/server.$PORT.log"
+  fi
+  if [ "$PORT" -lt 1024 ] && [ "$(id -u)" -ne 0 ]; then
+    warn "端口 $PORT 要 root，普通用户绑不上；改成 PORT=<高位端口> 或套反代"
+  fi
+  if [ "$DRY" = "1" ]; then
+    SCHEME=https
+    TLS_CERT="${TLS_CERT:-（将自动申请或自签）}"
+    return 0
+  fi
+  ensure_cert || true
+  if [ -n "$TLS_CERT" ]; then SCHEME=https; else SCHEME=http; fi
+}
+
 cmd_up() {
-  mkdir -p "$APP_DIR"
-  PY=$(pick_python) || die "没找到 python3（3.7+）。装一个：apt install -y python3"
-  if [ ! -f "$KEYFILE" ]; then gen_key >"$KEYFILE"; fi
-  if [ ! -f "$CONTENT" ]; then : >"$CONTENT"; fi
+  PY=$(pick_python) || { install_python && PY=$(pick_python); } || \
+    die "没找到 python3（3.7+），自动装也没成功。手动装：apt install -y python3"
+
+  resolve_port
+  resolve_plan
+  if [ "$PORT" -eq 443 ] && [ "$SCHEME" = http ]; then
+    warn "443 上跑的是明文 HTTP，浏览器会默认按 https 打、连不上；给 DOMAIN 走证书，或换个端口"
+  fi
+  if [ "$DRY" = "1" ]; then
+    printf '== 计划（DRY=1，什么都没动）==\n'
+    printf '  python  %s\n' "$PY"
+    printf '  端口    %s%s\n' "$PORT" "$([ "$PORT_GIVEN" -eq 1 ] && echo '（你指定）' || echo '（自动）')"
+    printf '  协议    %s\n' "$SCHEME"
+    printf '  域名    %s\n' "${DOMAIN:-（无）}"
+    printf '  证书    %s\n' "${TLS_CERT:-（不用证书）}"
+    printf '  目录    %s\n' "$APP_DIR"
+    return 0
+  fi
+
   if [ -n "$TLS_CERT" ]; then
     [ -r "$TLS_CERT" ] || die "TLS_CERT 指的文件读不到：$TLS_CERT"
     if [ -n "$TLS_KEY" ] && [ ! -r "$TLS_KEY" ]; then die "TLS_KEY 指的文件读不到：$TLS_KEY"; fi
@@ -435,6 +635,12 @@ cmd_up() {
       warn "端口 $PORT < 1024，普通用户绑不上；用 root 跑，或换个高位端口（如 8443）"
     fi
   fi
+  mkdir -p "$APP_DIR"
+  if [ ! -f "$KEYFILE" ]; then gen_key >"$KEYFILE"; fi
+  if [ ! -f "$CONTENT" ]; then : >"$CONTENT"; fi
+  if [ ! -s "$INSTANCE_FILE" ]; then gen_key >"$INSTANCE_FILE"; fi
+  INSTANCE=$(tr -dc 'A-Za-z0-9' <"$INSTANCE_FILE" 2>/dev/null || true)
+
   write_server
   if [ -f "${BASH_SOURCE[0]:-}" ] && [ -s "${BASH_SOURCE[0]:-}" ]; then
     cp -f "${BASH_SOURCE[0]}" "$APP_DIR/deploy.sh" 2>/dev/null || true
@@ -443,7 +649,7 @@ cmd_up() {
   if port_busy "$PORT"; then
     local pid=""
     pid=$(port_owner "$PORT")
-    if [ -n "$pid" ] && is_ours "$pid"; then
+    if port_is_ours "$PORT" || { [ -n "$pid" ] && is_ours "$pid"; }; then
       warn "端口 $PORT 上是本服务（PID $pid），重启它"
       cmd_down >/dev/null 2>&1 || true
     else
@@ -478,10 +684,11 @@ cmd_up() {
     cmd_down >/dev/null 2>&1 || true
   fi
 
+  printf '%s\n' "$PORT" >"$APP_DIR/port.txt"   # 记下来，下次 down/status 不用再猜
   : >"$LOG"
   rm -f "$PIDFILE"
   ( cd "$APP_DIR" && HOST="$BIND" PORT="$PORT" EDIT_KEY="$(cat "$KEYFILE")" PIDFILE="$PIDFILE" \
-    TLS_CERT="$TLS_CERT" TLS_KEY="$TLS_KEY" \
+    TLS_CERT="$TLS_CERT" TLS_KEY="$TLS_KEY" INSTANCE="$INSTANCE" \
     nohup "$PY" "$SRV" </dev/null >>"$LOG" 2>&1 & )
 
   local i=0
@@ -518,7 +725,7 @@ cmd_set() {
 }
 
 usage() {
-  sed -n '2,13p' "${BASH_SOURCE[0]:-$0}" 2>/dev/null | sed 's/^# \{0,1\}//' || true
+  sed -n '2,12p' "${BASH_SOURCE[0]:-$0}" 2>/dev/null | sed 's/^# \{0,1\}//' || true
 }
 
 case "${1:-up}" in
