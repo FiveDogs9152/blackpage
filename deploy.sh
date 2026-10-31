@@ -51,7 +51,7 @@ wizard(){ [ -w /dev/tty ] || return 0
   echo "已记住，下次一条命令直接起" >&2; }
 
 srv(){ mkdir -p "$APP"; cat >"$APP/server.py" <<'PY'
-import os,ssl,html
+import os,ssl,html,json,time
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer as S
 from urllib.parse import urlparse,parse_qs
 A=os.environ["A"];K=os.environ["K"];C=A+"/content.txt";P=int(os.environ["P"])
@@ -67,10 +67,18 @@ class H(BaseHTTPRequestHandler):
     def do_GET(s):
         u=urlparse(s.path)
         if u.path=="/raw":return s.out(body(),k="text/plain; charset=utf-8")
-        if u.path=="/edit":
-            if parse_qs(u.query).get("k",[""])[0]!=K:return s.out("403",403)
-            return s.out('<meta name=viewport content="width=device-width"><style>html,body{margin:0;background:#000;color-scheme:dark;height:100%}textarea,button{box-sizing:border-box}</style><form method=post action="/save?k='+K+'" style="margin:0"><textarea name=t autofocus style="width:100%;height:86vh;border:0;'+CSS+'">'+html.escape(body())+'</textarea><button style="width:100%;padding:14px;border:0;background:#fff;color:#000;font-size:16px">保存</button></form>')
-        s.out('<meta name=viewport content="width=device-width"><style>html,body{margin:0;background:#000;color-scheme:dark;min-height:100%}</style><pre id=p style="'+CSS+'">'+html.escape(body())+'</pre><script>setInterval(async()=>{document.getElementById("p").textContent=await(await fetch("/raw")).text},3000)</script>')
+        if u.path=="/events":
+            s.send_response(200);s.send_header("Content-Type","text/event-stream")
+            s.send_header("Cache-Control","no-cache");s.end_headers()
+            last=None
+            try:
+                while True:
+                    t=body()
+                    if t!=last:
+                        s.wfile.write(("data: "+json.dumps(t)+"\n\n").encode());s.wfile.flush();last=t
+                    time.sleep(0.4)
+            except Exception:return
+        s.out('<meta name=viewport content="width=device-width"><style>html,body{margin:0;background:#000;color-scheme:dark;min-height:100%}</style><pre id=p style="'+CSS+'">'+html.escape(body())+'</pre><script>const E=new EventSource("/events");E.onmessage=e=>{document.getElementById("p").textContent=JSON.parse(e.data)}</script>')
     def do_POST(s):
         u=urlparse(s.path)
         if parse_qs(u.query).get("k",[""])[0]!=K:return s.out("403",403)
