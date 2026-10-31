@@ -2,6 +2,7 @@
 # blackpage — 黑底白字一页纸。一条命令搞定，第一次跑它会问你两句话。
 set -euo pipefail
 APP=${APP:-$HOME/.blackpage}; CFG=$APP/config
+mkdir -p "$APP" 2>/dev/null || true
 PORT=8080; PG=0; DOMAIN=; CERT=; KEYF=; PROXY=0; FORCE=0; CMD=up; ARGS=()
 if [ -r "$CFG" ]; then . "$CFG"; fi   # 上次的回答：DOMAIN / CERT / KEYF
 while [ $# -gt 0 ]; do case $1 in
