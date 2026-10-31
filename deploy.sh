@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
-# blackpage — 黑底白字一页纸，写什么显示什么。bash deploy.sh -h 看用法
+# blackpage — 黑底白字一页纸。一条命令搞定，第一次跑它会问你两句话。
 set -euo pipefail
-APP=${APP:-$HOME/.blackpage}; PORT=8080; PG=0; DOMAIN=; FORCE=0; CMD=up; ARGS=()
+APP=${APP:-$HOME/.blackpage}; CFG=$APP/config
+PORT=8080; PG=0; DOMAIN=; CERT=; KEYF=; FORCE=0; CMD=up; ARGS=()
+if [ -r "$CFG" ]; then . "$CFG"; fi   # 上次的回答：DOMAIN / CERT / KEYF
 while [ $# -gt 0 ]; do case $1 in
   up|down|status|set|log|help) CMD=$1 ;;
-  -p|--port)   PORT=${2:?-p 后面要端口号}; PG=1; shift ;;
-  -d|--domain) DOMAIN=${2:?-d 后面要域名}; shift ;;
+  -p|--port)   PORT=${2:?}; PG=1; shift ;;
+  -d|--domain) DOMAIN=${2:?}; shift ;;
+  --cert)      CERT=${2:?}; shift ;;
+  --key)       KEYF=${2:?}; shift ;;
   -f|--force)  FORCE=1 ;;
   -h|--help)   CMD=help ;;
   -*) echo "未知选项: $1"; exit 2 ;;
@@ -15,20 +19,36 @@ esac; shift; done
 help(){ cat <<'USAGE'
 blackpage — 黑底白字一页纸
 
-  bash deploy.sh [-p 端口] [-d 域名] [-f]   起服务（默认 8080 明文）
-  bash deploy.sh set "要显示的字"            命令行直接换内容
-  bash deploy.sh status                      看在哪、活没活
-  bash deploy.sh down                        停自己
-  bash deploy.sh log                         最后 50 行日志
+  curl -fsSL .../deploy.sh | bash      一条命令，第一次问两句就完事
+  bash deploy.sh set "要显示的字"       命令行直接换内容
+  bash deploy.sh status | down | log   看状态 / 停 / 看日志
 
-  -d 域名   走 443 + 自动证书（要 root，80/443 空着）；浏览器打开 https://域名
-  -p 端口   指定端口
-  -f        端口被别人的服务占着时，允许结束它（不加则只报告并自动换端口）
+  -p 端口   指定端口（默认 8080；配了域名就是 443）
+  -d 域名   改域名
+  --cert / --key   用你已有的证书（不写就自动找 /etc/letsencrypt，再不行自签）
+  -f        端口被别人占着时允许结束它（不加则只报告并自动换端口）
 USAGE
 }
 
 busy(){ python3 -c 'import socket,sys;s=socket.socket();s.settimeout(.3);sys.exit(0 if s.connect_ex(("127.0.0.1",int(sys.argv[1])))==0 else 1)' "$1"; }
 ours(){ python3 -c 'import sys;sys.exit(0 if b"server.py" in open("/proc/"+sys.argv[1]+"/cmdline","rb").read() else 1)' "$1" 2>/dev/null; }
+ask(){ local a; printf '%s' "$1" >/dev/tty; read -r a </dev/tty 2>/dev/null || a=; printf '%s' "$a"; }
+
+wizard(){ [ -w /dev/tty ] || return 0
+  local d c k auto auto_k
+  auto=$(ls -1 /etc/letsencrypt/live/*/fullchain.pem 2>/dev/null | head -1 || true)
+  auto_k=${auto:+${auto%/fullchain.pem}/privkey.pem}
+  echo >&2; echo "第一次跑，问两句（存 $CFG，以后不再问）" >&2
+  d=$(ask '域名（直接回车 = 用 IP 跑明文 8080）: ')
+  [ -n "$d" ] || return 0
+  c=$(ask "证书 fullchain.pem [${auto:-自签}]: ")
+  k=$(ask "私钥 privkey.pem [${auto_k:-自签}]: ")
+  DOMAIN=$d; CERT=${c:-$auto}; KEYF=${k:-$auto_k}
+  mkdir -p "$APP"
+  { printf 'DOMAIN=%s\n' "$DOMAIN"
+    [ -n "$CERT" ] && printf 'CERT=%s\n' "$CERT"
+    [ -n "$KEYF" ] && printf 'KEYF=%s\n' "$KEYF"; } >"$CFG"
+  echo "已记住，下次一条命令直接起" >&2; }
 
 srv(){ mkdir -p "$APP"; cat >"$APP/server.py" <<'PY'
 import os,ssl,html
@@ -65,19 +85,30 @@ print("ready",flush=True);srv.serve_forever()
 PY
 }
 
-cert(){ CR=$APP/tls/fullchain.pem; KY=$APP/tls/key.pem; mkdir -p "$APP/tls"
-  [ -s "$CR" ] && return 0
+selfsign(){ mkdir -p "$APP/tls"
+  openssl req -x509 -newkey rsa:2048 -nodes -days 365 -keyout "$APP/tls/key.pem" \
+    -out "$APP/tls/fullchain.pem" -subj "/CN=$DOMAIN" -addext "subjectAltName=DNS:$DOMAIN" 2>/dev/null
+  CERT=$APP/tls/fullchain.pem; KEYF=$APP/tls/key.pem
+  echo "证书: 自签（浏览器会提示不安全，点继续即可）"; }
+
+le(){ mkdir -p "$APP/tls"
   if [ "$(id -u)" = 0 ] && curl -fsSL https://get.acme.sh -o /tmp/acme.sh 2>/dev/null; then
     sh /tmp/acme.sh >/dev/null 2>&1 || true
     ~/.acme.sh/acme.sh --issue -d "$DOMAIN" --standalone --server letsencrypt 2>&1 | tail -3 || true
-    ~/.acme.sh/acme.sh --install-cert -d "$DOMAIN" --key-file "$KY" --fullchain-file "$CR" >/dev/null 2>&1 || true
+    ~/.acme.sh/acme.sh --install-cert -d "$DOMAIN" --key-file "$APP/tls/key.pem" \
+      --fullchain-file "$APP/tls/fullchain.pem" >/dev/null 2>&1 || true
   fi
-  [ -s "$CR" ] && { echo "证书: Let's Encrypt"; return 0; }
-  openssl req -x509 -newkey rsa:2048 -nodes -days 365 -keyout "$KY" -out "$CR" -subj "/CN=$DOMAIN" -addext "subjectAltName=DNS:$DOMAIN" 2>/dev/null
-  echo "证书: 自签（浏览器会提示不安全，点继续即可）"
-}
+  if [ -s "$APP/tls/fullchain.pem" ]; then
+    CERT=$APP/tls/fullchain.pem; KEYF=$APP/tls/key.pem; echo "证书: Let's Encrypt"; return 0
+  fi
+  return 1; }
 
-up(){ if [ -n "$DOMAIN" ]; then if [ "$PG" = 1 ]; then :; else PORT=443; fi; cert; fi
+up(){ if [ "$CMD" = up ] && [ -z "$DOMAIN" ] && [ ! -r "$CFG" ]; then wizard; fi
+  if [ -n "$DOMAIN" ]; then
+    [ "$PG" = 1 ] || PORT=443
+    if [ -z "$CERT" ]; then le || selfsign; fi
+    if [ -s "$CERT" ] && [ -s "${KEYF:-}" ]; then echo "证书: $CERT"; else echo "证书不可用，退回明文"; CERT=; KEYF=; fi
+  fi
   srv; mkdir -p "$APP"; [ -f "$APP/content.txt" ] || : >"$APP/content.txt"
   [ -s "$APP/key.txt" ] || python3 -c 'import secrets;print(secrets.token_urlsafe(9))' >"$APP/key.txt"
   K=$(cat "$APP/key.txt")
@@ -89,19 +120,17 @@ up(){ if [ -n "$DOMAIN" ]; then if [ "$PG" = 1 ]; then :; else PORT=443; fi; cer
       echo "端口 $PORT 被别人的进程占着${O:+（pid $O）}，没动它"
       if [ "$FORCE" = 1 ] && [ -n "${O:-}" ]; then echo "按 -f 结束它"; kill "$O" 2>/dev/null || true; sleep 1
       else echo "换端口: bash deploy.sh -p $((PORT+1))    确要停它加 -f"; exit 1; fi
-      busy "$PORT" && { echo "端口 $PORT 仍被占用，收手"; exit 1; }
+      if busy "$PORT"; then echo "端口 $PORT 仍被占用，收手"; exit 1; fi
     fi
   fi
-  CERT= KEYF=; if [ -s "$APP/tls/fullchain.pem" ]; then CERT=$APP/tls/fullchain.pem; KEYF=$APP/tls/key.pem; fi
   A="$APP" K="$K" P="$PORT" CERT="$CERT" KEYF="$KEYF" nohup python3 "$APP/server.py" >"$APP/server.log" 2>&1 &
   echo $! >"$APP/pid"
   for i in $(seq 30); do busy "$PORT" && break; sleep 0.2; done
   busy "$PORT" || { echo "没起来，看日志: bash deploy.sh log"; exit 1; }
   S=http; [ -n "$CERT" ] && S=https
   IP=$(python3 -c 'import socket;s=socket.socket();s.connect(("8.8.8.8",80));print(s.getsockname()[0])' 2>/dev/null || echo 127.0.0.1)
-  H=${DOMAIN:-$IP}; [ "$S" = https ] && [ "$PORT" = 443 ] || H=$H:$PORT
-  echo; echo "  页面    $S://$H"; echo "  改内容  $S://$H/edit?k=$K"; echo "  停止    bash deploy.sh down"
-}
+  H=${DOMAIN:-$IP}; { [ "$S" = https ] && [ "$PORT" = 443 ]; } || H=$H:$PORT
+  echo; echo "  页面    $S://$H"; echo "  改内容  $S://$H/edit?k=$K"; echo "  停止    bash deploy.sh down"; }
 
 case "$CMD" in
   help) help ;;
