@@ -127,13 +127,21 @@ ps_args() {
   printf '%s' "$out"
 }
 
+# pid 还活着吗（pidfile 里可能存的是原生 pid，Windows 上要用 ps -W 换算）
+alive() {
+  local p="$1"
+  [ -n "$p" ] || return 1
+  kill -0 "$p" 2>/dev/null && return 0
+  ps -W 2>/dev/null | awk -v p="$p" 'NR > 1 && ($1 == p || $4 == p) {f = 1} END {exit !f}'
+}
+
 # 这个 pid 是不是本服务（看 pidfile + 命令行里的绝对路径）
 is_ours() {
   local pid="$1" own=""
-  kill -0 "$pid" 2>/dev/null || return 1
+  alive "$pid" || return 1
   if [ -f "$PIDFILE" ]; then own=$(cat "$PIDFILE" 2>/dev/null || true); fi
   if [ -n "$own" ] && [ "$own" = "$pid" ]; then return 0; fi
-  case "$(ps_args "$pid")" in *"$SRV"*) return 0;; esac
+  case "$(ps_args "$pid")" in *"$SRV"*|*server.py*) return 0;; esac
   return 1
 }
 
@@ -320,6 +328,13 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    pf = os.environ.get("PIDFILE")
+    if pf:
+        try:
+            with open(pf, "w", encoding="utf-8") as f:
+                f.write(str(os.getpid()))
+        except OSError:
+            pass
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
     httpd.daemon_threads = True
     print(f"blackpage on http://{HOST}:{PORT}", flush=True)
@@ -338,14 +353,27 @@ PYEOF
 }
 
 cmd_down() {
-  local pid="" i=0
+  local pid="" i=0 o=""
   if [ -f "$PIDFILE" ]; then pid=$(cat "$PIDFILE" 2>/dev/null || true); fi
-  if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
-    rm -f "$PIDFILE"; ok "本来就没在跑"; return 0
+  # pidfile 对不上（重启过、换了平台）就用端口找主人，只认命令行里带 server.py 的
+  if [ -z "$pid" ] || ! alive "$pid"; then
+    o=$(port_owner "$PORT")
+    if [ -n "$o" ] && is_ours "$o"; then pid="$o"; fi
   fi
-  kill -TERM "$pid" 2>/dev/null || true
-  while [ "$i" -lt 50 ] && kill -0 "$pid" 2>/dev/null; do i=$((i + 1)); sleep 0.1; done
-  kill -KILL "$pid" 2>/dev/null || true
+  if [ -z "$pid" ] || ! alive "$pid"; then
+    rm -f "$PIDFILE"
+    if port_busy "$PORT"; then
+      warn "端口 $PORT 还在监听，但 pid 对不上，看不出是不是我起的，没动它"
+      exit 1
+    fi
+    ok "本来就没在跑"; return 0
+  fi
+  # 只有本 shell 认识的 pid 才发信号；原生 pid 交给下面的 taskkill 兜底
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -TERM "$pid" 2>/dev/null || true
+    while [ "$i" -lt 50 ] && kill -0 "$pid" 2>/dev/null; do i=$((i + 1)); sleep 0.1; done
+    kill -KILL "$pid" 2>/dev/null || true
+  fi
   # 信号不一定真管用：用"端口是否释放"验收，别嘴上说停了
   if ! wait_free 3; then hard_kill "$PORT" || true; wait_free 2 || true; fi
   if port_busy "$PORT"; then
@@ -364,10 +392,14 @@ cmd_status() {
   if [ -f "$KEYFILE" ]; then key=$(cat "$KEYFILE" 2>/dev/null || true); fi
   ip=$(hostname -I 2>/dev/null | awk '{print $1}' || true)
   [ -n "${ip:-}" ] || ip="<服务器IP>"
-  if [ -n "${pid:-}" ] && kill -0 "$pid" 2>/dev/null; then
+  if [ -n "${pid:-}" ] && alive "$pid"; then
     ok "在跑（PID $pid，端口 $PORT）"
     printf '  页面  http://%s:%s\n' "$ip" "$PORT"
     printf '  编辑  http://%s:%s/edit?k=%s\n' "$ip" "$PORT" "$key"
+  elif port_busy "$PORT"; then
+    warn "端口 $PORT 在监听，但 pid 对不上（不是我起的，或换了平台）"
+    printf '  页面  http://%s:%s
+' "$ip" "$PORT"
   else
     warn "没在跑"
   fi
@@ -424,8 +456,9 @@ cmd_up() {
   fi
 
   : >"$LOG"
-  ( cd "$APP_DIR" && HOST="$BIND" PORT="$PORT" EDIT_KEY="$(cat "$KEYFILE")" \
-    nohup "$PY" "$SRV" </dev/null >>"$LOG" 2>&1 & echo $! >"$PIDFILE" )
+  rm -f "$PIDFILE"
+  ( cd "$APP_DIR" && HOST="$BIND" PORT="$PORT" EDIT_KEY="$(cat "$KEYFILE")" PIDFILE="$PIDFILE" \
+    nohup "$PY" "$SRV" </dev/null >>"$LOG" 2>&1 & )
 
   local i=0
   while [ "$i" -lt 60 ] &&

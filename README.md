@@ -3,7 +3,7 @@
 一个文件、一行命令，把「黑底白字、你想写什么就显示什么」的页面跑起来。
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/<USER>/blackpage/main/deploy.sh | bash
+curl -fsSL https://raw.githubusercontent.com/FiveDogs9152/blackpage/main/deploy.sh | bash
 ```
 
 跑完会打印两个地址：
@@ -62,5 +62,5 @@ yum install -y python3      # CentOS/RHEL
 `raw.githubusercontent.com` 有时候很慢，可以换：
 
 ```bash
-curl -fsSL https://cdn.jsdelivr.net/gh/<USER>/blackpage@main/deploy.sh | bash
+curl -fsSL https://cdn.jsdelivr.net/gh/FiveDogs9152/blackpage@main/deploy.sh | bash
 ```
