@@ -55,7 +55,7 @@ import os,ssl,html
 from http.server import BaseHTTPRequestHandler,ThreadingHTTPServer as S
 from urllib.parse import urlparse,parse_qs
 A=os.environ["A"];K=os.environ["K"];C=A+"/content.txt";P=int(os.environ["P"])
-CSS="margin:0;padding:24px;background:#000;color:#fff;font:16px/1.7 ui-monospace,Menlo,monospace;white-space:pre-wrap;word-break:break-word"
+CSS="margin:0;min-height:100vh;box-sizing:border-box;padding:24px;background:#000;color:#fff;font:16px/1.7 ui-monospace,Menlo,monospace;white-space:pre-wrap;word-break:break-word"
 def body():
     try:return open(C,encoding="utf-8").read()
     except OSError:return ""
@@ -69,8 +69,8 @@ class H(BaseHTTPRequestHandler):
         if u.path=="/raw":return s.out(body(),k="text/plain; charset=utf-8")
         if u.path=="/edit":
             if parse_qs(u.query).get("k",[""])[0]!=K:return s.out("403",403)
-            return s.out('<meta name=viewport content="width=device-width"><form method=post action="/save?k='+K+'" style="margin:0"><textarea name=t autofocus style="width:100%;height:86vh;border:0;'+CSS+'">'+html.escape(body())+'</textarea><button style="width:100%;padding:14px;border:0;background:#fff;color:#000;font-size:16px">保存</button></form>')
-        s.out('<meta name=viewport content="width=device-width"><body style="background:#000"><pre id=p style="'+CSS+'">'+html.escape(body())+'</pre><script>setInterval(async()=>{document.getElementById("p").textContent=await(await fetch("/raw")).text},3000)</script>')
+            return s.out('<meta name=viewport content="width=device-width"><style>html,body{margin:0;background:#000;color-scheme:dark;height:100%}textarea,button{box-sizing:border-box}</style><form method=post action="/save?k='+K+'" style="margin:0"><textarea name=t autofocus style="width:100%;height:86vh;border:0;'+CSS+'">'+html.escape(body())+'</textarea><button style="width:100%;padding:14px;border:0;background:#fff;color:#000;font-size:16px">保存</button></form>')
+        s.out('<meta name=viewport content="width=device-width"><style>html,body{margin:0;background:#000;color-scheme:dark;min-height:100%}</style><pre id=p style="'+CSS+'">'+html.escape(body())+'</pre><script>setInterval(async()=>{document.getElementById("p").textContent=await(await fetch("/raw")).text},3000)</script>')
     def do_POST(s):
         u=urlparse(s.path)
         if parse_qs(u.query).get("k",[""])[0]!=K:return s.out("403",403)
