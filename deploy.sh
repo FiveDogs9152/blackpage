@@ -2,7 +2,7 @@
 # blackpage — 黑底白字一页纸。一条命令搞定，第一次跑它会问你两句话。
 set -euo pipefail
 APP=${APP:-$HOME/.blackpage}; CFG=$APP/config
-PORT=8080; PG=0; DOMAIN=; CERT=; KEYF=; FORCE=0; CMD=up; ARGS=()
+PORT=8080; PG=0; DOMAIN=; CERT=; KEYF=; PROXY=0; FORCE=0; CMD=up; ARGS=()
 if [ -r "$CFG" ]; then . "$CFG"; fi   # 上次的回答：DOMAIN / CERT / KEYF
 while [ $# -gt 0 ]; do case $1 in
   up|down|status|set|log|help) CMD=$1 ;;
@@ -11,6 +11,7 @@ while [ $# -gt 0 ]; do case $1 in
   --cert)      CERT=${2:?}; shift ;;
   --key)       KEYF=${2:?}; shift ;;
   -f|--force)  FORCE=1 ;;
+  -P|--behind-proxy) PROXY=1 ;;
   -h|--help)   CMD=help ;;
   -*) echo "未知选项: $1"; exit 2 ;;
   *)  ARGS+=("$1") ;;
@@ -41,6 +42,14 @@ wizard(){ [ -w /dev/tty ] || return 0
   echo >&2; echo "第一次跑，问两句（存 $CFG，以后不再问）" >&2
   d=$(ask '域名（直接回车 = 用 IP 跑明文 8080）: ')
   [ -n "$d" ] || return 0
+  pv=$(ask '这个域名是不是挂在 Cloudflare / 反向代理后面（证书它管）? [y/N]: ')
+  case "$pv" in [yY]*) PROXY=1 ;; esac
+  if [ "$PROXY" = 1 ]; then
+    DOMAIN=$d; CERT=; KEYF=
+    printf 'DOMAIN=%s\nPROXY=1\n' "$DOMAIN" >"$CFG"
+    echo "记住了：本机跑 80 明文，证书交给 Cloudflare" >&2
+    return 0
+  fi
   c=$(ask "证书 fullchain.pem [${auto:-自签}]: ")
   k=$(ask "私钥 privkey.pem [${auto_k:-自签}]: ")
   DOMAIN=$d; CERT=${c:-$auto}; KEYF=${k:-$auto_k}
@@ -69,7 +78,7 @@ class H(BaseHTTPRequestHandler):
         if u.path=="/raw":return s.out(body(),k="text/plain; charset=utf-8")
         if u.path=="/events":
             s.send_response(200);s.send_header("Content-Type","text/event-stream")
-            s.send_header("Cache-Control","no-cache");s.end_headers()
+            s.send_header("Cache-Control","no-store");s.send_header("X-Accel-Buffering","no");s.end_headers()
             last=None
             try:
                 while True:
@@ -112,7 +121,10 @@ le(){ mkdir -p "$APP/tls"
   return 1; }
 
 up(){ if [ "$CMD" = up ] && [ -z "$DOMAIN" ] && [ ! -r "$CFG" ]; then wizard; fi
-  if [ -n "$DOMAIN" ]; then
+  if [ "$PROXY" = 1 ]; then
+    [ "$PG" = 1 ] || PORT=80
+    CERT=; KEYF=
+  elif [ -n "$DOMAIN" ]; then
     [ "$PG" = 1 ] || PORT=443
     if [ -z "$CERT" ]; then le || selfsign; fi
     if [ -s "$CERT" ] && [ -s "${KEYF:-}" ]; then echo "证书: $CERT"; else echo "证书不可用，退回明文"; CERT=; KEYF=; fi
@@ -136,6 +148,7 @@ up(){ if [ "$CMD" = up ] && [ -z "$DOMAIN" ] && [ ! -r "$CFG" ]; then wizard; fi
   for i in $(seq 30); do busy "$PORT" && break; sleep 0.2; done
   busy "$PORT" || { echo "没起来，看日志: bash deploy.sh log"; exit 1; }
   S=http; [ -n "$CERT" ] && S=https
+  if [ "$PROXY" = 1 ]; then S=https; PORT=443; fi
   IP=$(python3 -c 'import socket;s=socket.socket();s.connect(("8.8.8.8",80));print(s.getsockname()[0])' 2>/dev/null || echo 127.0.0.1)
   H=${DOMAIN:-$IP}; { [ "$S" = https ] && [ "$PORT" = 443 ]; } || H=$H:$PORT
   echo; echo "  页面    $S://$H"; echo "  改内容  $S://$H/edit?k=$K"; echo "  停止    bash deploy.sh down"; }

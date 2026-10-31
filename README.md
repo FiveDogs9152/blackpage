@@ -21,6 +21,16 @@ curl -fsSL https://raw.githubusercontent.com/FiveDogs9152/blackpage/main/deploy.
 回车跳过域名 → `http://服务器IP:8080`。
 没有现成证书就自签一张，chrome 提示不安全点「继续」即可。
 
+## 挂在 Cloudflare 后面
+
+域名走 CF 的话，证书由 CF 管，本机不用再折腾证书：向导里那句
+`这个域名是不是挂在 Cloudflare / 反向代理后面? [y/N]` 答 `y`，脚本就只跑 80 明文
+（打印的地址是 `https://你的域名`）。CF 那边设：
+
+- DNS：`A 你的域名 → 服务器 IP`，开橙云（Proxied）
+- SSL/TLS 模式：**Flexible**（因为源站是明文 80；选 Full 反而要源站有证书）
+- Speed → Optimization：**Rocket Loader 关掉**（它会改写页面脚本）
+
 ## 后续维护
 
 ```bash
