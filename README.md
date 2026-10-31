@@ -37,6 +37,36 @@ bash deploy.sh down            # 停掉自己
 
 `down` 也不会只凭信号就报告成功：杀完会轮询端口是否真的释放，没释放就明说没停干净。
 
+## HTTPS / 443
+
+443 不是个开关，它要两样东西：**端口 443** + **一张浏览器认的证书**。证书只签域名、不签裸 IP，
+所以只有 IP 的机器上只能自签（浏览器红警告，还得手动点继续），那种情况用 8080 明文反而更顺手。
+
+**有域名，且 443 已经被 nginx / caddy 占着（你的机器多半是这样）** —— 别去抢端口，让它反代过来：
+
+```nginx
+server_name txt.example.com;          # 证书用你现有的那套
+location / {
+    proxy_pass http://127.0.0.1:8080;
+    proxy_set_header Host $host;
+}
+```
+
+**或者让脚本自己说 TLS**（需要 443 空着，或换成 8443）：
+
+```bash
+curl https://get.acme.sh | sh -s email=you@example.com
+~/.acme.sh/acme.sh --issue -d txt.example.com --nginx
+~/.acme.sh/acme.sh --install-cert -d txt.example.com \
+  --key-file /etc/blackpage/key.pem --fullchain-file /etc/blackpage/fullchain.pem
+
+PORT=443 TLS_CERT=/etc/blackpage/fullchain.pem TLS_KEY=/etc/blackpage/key.pem bash deploy.sh
+```
+
+- 端口 < 1024 要 root 才绑得上；不想用 root 就 `PORT=8443` 再让 nginx 反代。
+- 443 被别人占着时，端口保护照样生效：先报是谁，不抢。
+- 不设 `TLS_CERT` 就是老样子，明文 8080 —— 默认行为一点没变。
+
 ## 依赖
 
 只要有 `python3`（3.7+）。没有的话：

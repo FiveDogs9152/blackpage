@@ -15,6 +15,10 @@ PORT="${PORT:-8080}"
 APP_DIR="${APP_DIR:-$HOME/.blackpage}"
 BIND="${HOST:-0.0.0.0}"
 FORCE="${FORCE:-0}"
+TLS_CERT="${TLS_CERT:-}"              # 给了证书就自己说 HTTPS，不给就是明文
+TLS_KEY="${TLS_KEY:-}"
+SCHEME=http
+if [ -n "$TLS_CERT" ]; then SCHEME=https; fi
 
 PIDFILE="$APP_DIR/server.$PORT.pid"   # 一个端口一个 pidfile，实例互不覆盖
 KEYFILE="$APP_DIR/key.txt"
@@ -185,6 +189,8 @@ CONTENT = os.path.join(APP_DIR, "content.txt")
 HOST = os.environ.get("HOST", "0.0.0.0")
 PORT = int(os.environ.get("PORT", "8080"))
 EDIT_KEY = os.environ.get("EDIT_KEY", "").strip()
+TLS_CERT = os.environ.get("TLS_CERT", "").strip()
+TLS_KEY = os.environ.get("TLS_KEY", "").strip()
 MAX_BODY = 1 << 20
 
 _lock = threading.Lock()
@@ -337,7 +343,18 @@ def main():
             pass
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
     httpd.daemon_threads = True
-    print(f"blackpage on http://{HOST}:{PORT}", flush=True)
+    scheme = "http"
+    if TLS_CERT:
+        import ssl
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx.load_cert_chain(TLS_CERT, TLS_KEY or None)
+        try:
+            ctx.set_alpn_protocols(["http/1.1"])
+        except NotImplementedError:
+            pass
+        httpd.socket = ctx.wrap_socket(httpd.socket, server_side=True)
+        scheme = "https"
+    print(f"blackpage on {scheme}://{HOST}:{PORT}", flush=True)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
@@ -394,12 +411,11 @@ cmd_status() {
   [ -n "${ip:-}" ] || ip="<服务器IP>"
   if [ -n "${pid:-}" ] && alive "$pid"; then
     ok "在跑（PID $pid，端口 $PORT）"
-    printf '  页面  http://%s:%s\n' "$ip" "$PORT"
-    printf '  编辑  http://%s:%s/edit?k=%s\n' "$ip" "$PORT" "$key"
+    printf '  页面  %s://%s:%s\n' "$SCHEME" "$ip" "$PORT"
+    printf '  编辑  %s://%s:%s/edit?k=%s\n' "$SCHEME" "$ip" "$PORT" "$key"
   elif port_busy "$PORT"; then
     warn "端口 $PORT 在监听，但 pid 对不上（不是我起的，或换了平台）"
-    printf '  页面  http://%s:%s
-' "$ip" "$PORT"
+    printf '  页面  %s://%s:%s\n' "$SCHEME" "$ip" "$PORT"
   else
     warn "没在跑"
   fi
@@ -412,6 +428,13 @@ cmd_up() {
   PY=$(pick_python) || die "没找到 python3（3.7+）。装一个：apt install -y python3"
   if [ ! -f "$KEYFILE" ]; then gen_key >"$KEYFILE"; fi
   if [ ! -f "$CONTENT" ]; then : >"$CONTENT"; fi
+  if [ -n "$TLS_CERT" ]; then
+    [ -r "$TLS_CERT" ] || die "TLS_CERT 指的文件读不到：$TLS_CERT"
+    if [ -n "$TLS_KEY" ] && [ ! -r "$TLS_KEY" ]; then die "TLS_KEY 指的文件读不到：$TLS_KEY"; fi
+    if [ "$PORT" -lt 1024 ] && [ "$(id -u)" -ne 0 ]; then
+      warn "端口 $PORT < 1024，普通用户绑不上；用 root 跑，或换个高位端口（如 8443）"
+    fi
+  fi
   write_server
   if [ -f "${BASH_SOURCE[0]:-}" ] && [ -s "${BASH_SOURCE[0]:-}" ]; then
     cp -f "${BASH_SOURCE[0]}" "$APP_DIR/deploy.sh" 2>/dev/null || true
@@ -458,6 +481,7 @@ cmd_up() {
   : >"$LOG"
   rm -f "$PIDFILE"
   ( cd "$APP_DIR" && HOST="$BIND" PORT="$PORT" EDIT_KEY="$(cat "$KEYFILE")" PIDFILE="$PIDFILE" \
+    TLS_CERT="$TLS_CERT" TLS_KEY="$TLS_KEY" \
     nohup "$PY" "$SRV" </dev/null >>"$LOG" 2>&1 & )
 
   local i=0
@@ -476,8 +500,8 @@ cmd_up() {
   [ -n "${ip:-}" ] || ip="<服务器IP>"
   echo
   ok "blackpage 已启动"
-  printf '  页面  http://%s:%s\n' "$ip" "$PORT"
-  printf '  编辑  http://%s:%s/edit?k=%s\n' "$ip" "$PORT" "$key"
+  printf '  页面  %s://%s:%s\n' "$SCHEME" "$ip" "$PORT"
+  printf '  编辑  %s://%s:%s/edit?k=%s\n' "$SCHEME" "$ip" "$PORT" "$key"
   printf '  内容  %s\n' "$CONTENT"
   printf '  日志  %s\n' "$LOG"
   printf '  停止  bash %s/deploy.sh down\n' "$APP_DIR"
